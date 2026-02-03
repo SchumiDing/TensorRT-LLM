@@ -1,6 +1,6 @@
 import base64
 from typing import Optional
-
+import inspect
 import torch
 
 from tensorrt_llm import serialization
@@ -11,52 +11,29 @@ from tensorrt_llm.logger import logger
 
 
 class WorkerExtension:
-    """Worker extension class for extending TensorRT-LLM Ray workers with custom functionality.
+    def __init__(self):
+        pass
 
-    This class can be injected into tensorrt_llm.LLM() by specifying it via the
-    ray_worker_extension_cls parameter in LLMArgs when using orchestrator_type='ray'.
-    The extension methods will be available on each Ray worker and can be called via
-    the LLM's collective RPC mechanism.
-
-    Examples:
-        Creating an LLM with worker extension:
-
-        >>> llm = LLM(
-        ...     model=model_dir,
-        ...     orchestrator_type="ray",
-        ...     ray_worker_extension_cls="rlhf_utils.WorkerExtension",
-        ... )
-
-        Calling extension methods via collective RPC:
-
-        >>> llm._collective_rpc("update_weights", args=(ipc_handles,))
-    """
+    @control_action_decorator
+    def supports_partial_loading(self) -> bool:
+        """Check if the model supports partial weight loading."""
+        try:
+            model = self.engine.model_engine.model
+            load_weights_args = inspect.getfullargspec(model.load_weights).args
+            return "allow_partial_loading" in load_weights_args
+        except Exception as e:
+            logger.warning(f"Failed to check partial loading support: {e}")
+            return False
 
     @control_action_decorator
     def update_weights(self, ipc_handles: Optional[dict] = None):
-        """Update model weights from IPC (Inter-Process Communication) handles.
-
-        This method receives shared memory handles from another process (typically FSDP training),
-        reconstructs tensors from these handles, and loads them into the TensorRT-LLM model.
-        Uses the control_action_decorator to ensure all active requests are finished before
-        updating weights.
-
-        Args:
-            ipc_handles: Dictionary mapping device UUIDs to lists of (param_name, tensor_handle) tuples.
-                        Each tensor_handle is a tuple of (func, args) for reconstructing the tensor.
-
-        Raises:
-            ValueError: If the current device's UUID is not found in ipc_handles.
-            Exception: Re-raises any exception encountered during weight update.
-        """
         try:
             if not hasattr(self.engine.model_engine.model, "first_pre_reload_weights"):
                 for module in self.engine.model_engine.model.modules():
-                    if hasattr(module, "pre_reload_weights") and not getattr(
-                        module, "_weights_removed", False
-                    ):
+                    if hasattr(module, "pre_reload_weights") and not getattr(module, "_weights_removed", False):
                         module.pre_reload_weights()
-                setattr(self.engine.model_engine.model, "first_pre_reload_weights", True)
+                self.engine.model_engine.model.first_pre_reload_weights = True
+
             if ipc_handles is not None:
                 logger.info("Update weights from IPC handles")
                 device_uuid = get_device_uuid(self.device_id)
@@ -95,9 +72,7 @@ class WorkerExtension:
 
                     # Verify the result is a list as expected
                     if not isinstance(all_handles, list):
-                        raise ValueError(
-                            f"Deserialized data must be a list, got {type(all_handles).__name__} instead"
-                        )
+                        raise ValueError(f"Deserialized data must be a list, got {type(all_handles).__name__} instead")
                 else:
                     # Data is already in the correct format (backward compatibility)
                     all_handles = serialized_handles
@@ -110,9 +85,16 @@ class WorkerExtension:
                     weights[param_name] = tensor
 
                 logger.info(f"weights key size: {len(weights.keys())}")
-                self.engine.model_engine.model_loader.reload(
-                    self.engine.model_engine.model, weights, allow_partial_loading=True
-                )
+
+                # Check if model supports partial loading and use appropriate strategy
+                model = self.engine.model_engine.model
+                load_weights_args = inspect.getfullargspec(model.load_weights).args
+                supports_partial_loading = "allow_partial_loading" in load_weights_args
+
+                if supports_partial_loading:
+                    self.engine.model_engine.model_loader.reload(model, weights, allow_partial_loading=True)
+                else:
+                    self.engine.model_engine.model_loader.reload(model, weights, allow_partial_loading=False)
             else:
                 logger.info("Finalize update weights")
                 for module in self.engine.model_engine.model.modules():
@@ -120,9 +102,7 @@ class WorkerExtension:
                         module, "_weights_removed", False
                     ):
                         module.process_weights_after_loading()
-                    if hasattr(module, "post_load_weights") and not getattr(
-                        module, "_weights_removed", False
-                    ):
+                    if hasattr(module, "post_load_weights") and not getattr(module, "_weights_removed", False):
                         module.post_load_weights()
                 moe_load_balancer = getattr(self.engine.model_engine, "moe_load_balancer", None)
                 if isinstance(moe_load_balancer, MoeLoadBalancer):
