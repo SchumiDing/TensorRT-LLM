@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import base64
 from typing import Optional
 import inspect
@@ -14,9 +29,8 @@ class WorkerExtension:
     def __init__(self):
         pass
 
-    @control_action_decorator
-    def supports_partial_loading(self) -> bool:
-        """Check if the model supports partial weight loading."""
+    def _check_partial_loading_support(self) -> bool:
+        """Private helper to check if the model supports partial weight loading."""
         try:
             model = self.engine.model_engine.model
             load_weights_args = inspect.getfullargspec(model.load_weights).args
@@ -24,6 +38,11 @@ class WorkerExtension:
         except Exception as e:
             logger.warning(f"Failed to check partial loading support: {e}")
             return False
+
+    @control_action_decorator
+    def supports_partial_loading(self) -> bool:
+        """Check if the model supports partial weight loading."""
+        return self._check_partial_loading_support()
 
     @control_action_decorator
     def update_weights(self, ipc_handles: Optional[dict] = None):
@@ -72,7 +91,7 @@ class WorkerExtension:
 
                     # Verify the result is a list as expected
                     if not isinstance(all_handles, list):
-                        raise ValueError(f"Deserialized data must be a list, got {type(all_handles).__name__} instead")
+                        raise TypeError(f"Deserialized data must be a list, got {type(all_handles).__name__} instead")
                 else:
                     # Data is already in the correct format (backward compatibility)
                     all_handles = serialized_handles
@@ -88,8 +107,7 @@ class WorkerExtension:
 
                 # Check if model supports partial loading and use appropriate strategy
                 model = self.engine.model_engine.model
-                load_weights_args = inspect.getfullargspec(model.load_weights).args
-                supports_partial_loading = "allow_partial_loading" in load_weights_args
+                supports_partial_loading = self._check_partial_loading_support()
 
                 if supports_partial_loading:
                     self.engine.model_engine.model_loader.reload(model, weights, allow_partial_loading=True)
